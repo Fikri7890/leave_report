@@ -4,6 +4,8 @@ from PIL import Image
 import json
 import pandas as pd
 import io
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils import get_column_letter
 
 # ==========================================
 # 1. CONFIGURATION
@@ -66,10 +68,17 @@ if uploaded_files:
         # ------------------------------------------
         if app_mode == "Attendance Report OCR":
             if st.button('Extract Data & Generate Excel', use_container_width=True):
-                with st.spinner('Analyzing handwriting and formatting for Excel...'):
-                    prompt = '''
+                with st.spinner(f'Batch processing {len(images)} images in a SINGLE request...'):
+                    
+                    # 1. Prompt updated to handle MULTIPLE images and return a JSON ARRAY
+                    prompt = f'''
                     You are an expert at transcribing messy handwritten notes on printed timesheets. 
-                    Extract the data and return ONLY a valid JSON object. Do NOT include markdown formatting like ```json in the output.
+                    I am providing you with {len(images)} images of Attendance Reports.
+                    You MUST extract the data for EVERY SINGLE IMAGE provided.
+                    
+                    Return ONLY a valid JSON ARRAY containing exactly {len(images)} objects. 
+                    Object 1 corresponds to IMAGE 1, Object 2 corresponds to IMAGE 2, and so on.
+                    Do NOT include markdown formatting like ```json in the output.
 
                     ### 🚨 HANDWRITING DICTIONARY & RULES 🚨
                     1. Known Codes: 'UPL', 'UPH', 'MC', 'AL', 'OT', 'OFF'.
@@ -79,150 +88,294 @@ if uploaded_files:
                     5. Checkmarks: Note any checkmarks (✓).
                     6. Margin Notes: Look for Malay text like "Lambat masuk" or math.
 
-                    Return EXACTLY this JSON structure:
-                    {
-                      "employee": {
-                        "User ID": "String", "Name": "String", "Department": "String", "Date Range": "String"
-                      },
-                      "timesheet": [
-                        {"Date": "String", "Day": "String", "In": "String", "Out": "String", "Work Hrs": "String", "Remarks": "String"}
-                      ],
-                      "summary": [
-                        "String"
-                      ],
-                      "notes": [
-                        "String"
-                      ]
-                    }
+                    Return EXACTLY this JSON structure (as an Array of objects):
+                    [
+                        {{
+                          "employee": {{
+                            "User ID": "String", "Name": "String", "Department": "String", "Date Range": "String"
+                          }},
+                          "timesheet": [
+                            {{"Date": "String", "Day": "String", "In": "String", "Out": "String", "Work Hrs": "String", "Remarks": "String"}}
+                          ],
+                          "summary": [
+                            "String"
+                          ],
+                          "notes": [
+                            "String"
+                          ]
+                        }}
+                    ]
                     '''
                     
                     try:
-                        request_content = [prompt] + images # <--- This flattens them into one list
+                        # 2. Interleave Text and Images
+                        request_content = [prompt]
+                        for i, img in enumerate(images):
+                            request_content.append(f"--- START OF IMAGE {i + 1} ---")
+                            request_content.append(img)
+                            request_content.append(f"--- END OF IMAGE {i + 1} ---")
 
+                        # 3. Make ONE single API call
                         response = model_flash.generate_content(
                             request_content, 
-                            generation_config=genai.types.GenerationConfig(temperature=0.1)
+                            generation_config=genai.types.GenerationConfig(temperature=0.0) # 0.0 for strict format adherence
                         )
                         
                         clean_json = response.text.replace('```json', '').replace('```', '').strip()
-                        data = json.loads(clean_json)
+                        extracted_data_list = json.loads(clean_json)
 
-                        # --- ADD THIS SAFEGUARD ---
-                        # If Gemini wraps the JSON in a list, extract the first dictionary
-                        if isinstance(data, list):
-                            data = data[0]
-                        # --------------------------
+                        # Safeguard: Ensure it returned a list
+                        if not isinstance(extracted_data_list, list):
+                            extracted_data_list = [extracted_data_list]
 
-                        st.success('Extraction Complete!')
+                        st.success(f'Extraction Complete! Processed {len(extracted_data_list)} records in 1 request.')
                         
-                        st.markdown("### Employee Information")
-                        for key, value in data.get('employee', {}).items():
-                            st.markdown(f"* **{key}:** {value}")
+                        # --- PREPARE MASTER LISTS FOR EXCEL ---
+                        all_timesheets_df = []
+                        all_employees_df = []
+                        
+                        # --- BUILD THE UI ---
+                        for idx, sheet in enumerate(extracted_data_list):
+                            emp_name = sheet.get('employee', {}).get('Name', 'Unknown')
                             
-                        st.markdown("### Timesheet Data")
-                        df_timesheet = pd.DataFrame(data.get('timesheet', []))
-                        st.dataframe(df_timesheet, use_container_width=True)
-                        
-                        # --- EXCEL GENERATION ---
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            df_timesheet.to_excel(writer, index=False, sheet_name='Timesheet Data')
-                            df_emp = pd.DataFrame(list(data.get('employee', {}).items()), columns=['Field', 'Value'])
-                            df_emp.to_excel(writer, index=False, sheet_name='Employee Info')
+                            with st.expander(f"📄 Record {idx + 1}: {emp_name}", expanded=True):
+                                st.markdown("### Employee Information")
+                                for key, value in sheet.get('employee', {}).items():
+                                    st.markdown(f"* **{key}:** {value}")
+                                    
+                                st.markdown("### Timesheet Data")
+                                df_timesheet = pd.DataFrame(sheet.get('timesheet', []))
+                                st.dataframe(df_timesheet, use_container_width=True)
+                                
+                                # Display Summary and Notes safely
+                                summary_list = sheet.get('summary', [])
+                                notes_list = sheet.get('notes', [])
+                                
+                                col_sum1, col_sum2 = st.columns(2)
+                                with col_sum1:
+                                    if summary_list:
+                                        st.markdown("### Summary")
+                                        for s in summary_list:
+                                            st.markdown(f"* {s}")
+                                with col_sum2:
+                                    if notes_list:
+                                        st.markdown("### Notes")
+                                        for n in notes_list:
+                                            st.markdown(f"* {n}")
+
+                            # --- COMPILE DATA FOR MASTER EXCEL ---
+                            if not df_timesheet.empty:
+                                # Inject employee info into the timesheet rows
+                                df_timesheet.insert(0, 'Date Range', sheet.get('employee', {}).get('Date Range', 'Unknown'))
+                                df_timesheet.insert(0, 'Department', sheet.get('employee', {}).get('Department', 'Unknown'))
+                                df_timesheet.insert(0, 'User ID', sheet.get('employee', {}).get('User ID', 'Unknown'))
+                                df_timesheet.insert(0, 'Name', emp_name)
+                                all_timesheets_df.append(df_timesheet)
                             
-                        excel_data = output.getvalue()
-                        
-                        st.download_button(
-                            label="📥 Download as Excel (.xlsx)",
-                            data=excel_data,
-                            file_name="timesheet_report.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            type="primary",
-                            use_container_width=True
-                        )
-                        
+                            # Create a flat row for the employee info sheet, merging the arrays into strings
+                            emp_row = sheet.get('employee', {}).copy()
+                            emp_row['Summary'] = " | ".join(summary_list) if isinstance(summary_list, list) else str(summary_list)
+                            emp_row['Notes'] = " | ".join(notes_list) if isinstance(notes_list, list) else str(notes_list)
+                            all_employees_df.append(emp_row)
+
+                        # --- GENERATE MASTER EXCEL FILE ---
+                        if all_employees_df:
+                            final_records = pd.concat(all_employees_df, ignore_index=True)
+                            final_summaries = pd.DataFrame(all_employees_df)
+
+                            output = io.BytesIO()
+                            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                                final_records.to_excel(writer, index=False, sheet_name='All OT Records')
+                                final_summaries.to_excel(writer, index=False, sheet_name='All Summaries')
+                                
+                                # --- NEW: APPLY EXCEL TABLE FORMATTING & LINES ---
+                                workbook = writer.book
+                                
+                                for sheet_name in ['All OT Records', 'All Summaries']:
+                                    worksheet = writer.sheets[sheet_name]
+                                    max_row = worksheet.max_row
+                                    max_col = worksheet.max_column
+                                    
+                                    # 1. Define the table range (e.g., "A1:G15")
+                                    table_range = f"A1:{get_column_letter(max_col)}{max_row}"
+                                    
+                                    # 2. Create the Table object
+                                    safe_name = sheet_name.replace(" ", "_") # Excel table names can't have spaces
+                                    tab = Table(displayName=safe_name, ref=table_range)
+                                    
+                                    # 3. Apply a default Excel style (Adds lines, banded rows, and header filters)
+                                    style = TableStyleInfo(
+                                        name="TableStyleMedium9", 
+                                        showRowStripes=True,
+                                        showColumnStripes=False
+                                    )
+                                    tab.tableStyleInfo = style
+                                    worksheet.add_table(tab)
+                                    
+                                    # 4. Auto-adjust column widths so text isn't hidden
+                                    for col in worksheet.columns:
+                                        max_length = 0
+                                        column = col[0].column_letter # Get the column name
+                                        for cell in col:
+                                            try:
+                                                if len(str(cell.value)) > max_length:
+                                                    max_length = len(str(cell.value))
+                                            except:
+                                                pass
+                                        adjusted_width = (max_length + 2)
+                                        worksheet.column_dimensions[column].width = adjusted_width
+
+                            excel_data = output.getvalue()
+                            
+                            st.download_button(
+                                label="📥 Download Master Excel (.xlsx)",
+                                data=excel_data,
+                                file_name="Master_Leave_OT_Report.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                type="primary",
+                                use_container_width=True
+                            )
+                            
                     except Exception as e:
-                        st.error(f'Error parsing data. Please try again.')
+                        st.error(f'Error processing batch. Please try again.')
                         st.expander("View Error Log").write(e)
-
         # ------------------------------------------
         # MODE B: LEAVE/OVERTIME RECORD
         # ------------------------------------------
         elif app_mode == "Leave/Overtime OCR":
             if st.button('Extract Overtime Data & Generate Excel', use_container_width=True):
-                with st.spinner('Analyzing all OT records and calculating hours...'):
-                    # Changed structure to an ARRAY [] so it can hold multiple employees/pages
-                    prompt = """
-                    You are a data extraction assistant. Analyze all the provided Leave/Overtime/Replacement Record images.
-                    Extract the information and format it EXACTLY as the JSON structure below. 
-                    Calculate the totals accurately. Return ONLY valid JSON, do NOT include markdown formatting like ```json.
+                with st.spinner(f'Batch processing {len(images)} images in a SINGLE request...'):
+                    
+                    # 1. Prompt simplified: AI no longer calculates the summary.
+                    prompt = f"""
+                    You are a data extraction assistant. I am providing you with {len(images)} images of Leave/Overtime Records.
+                    You MUST extract the data for EVERY SINGLE IMAGE provided.
+                    
+                    Return ONLY a valid JSON ARRAY containing exactly {len(images)} objects. 
+                    Object 1 corresponds to IMAGE 1, Object 2 corresponds to IMAGE 2, and so on.
+                    Do NOT include markdown formatting like ```json.
 
                     ### 🚨 EXTRACTION RULES 🚨
-                    1. Extract all rows from the table across ALL provided images. Empty cells should be an empty string "".
+                    1. Extract all rows from the table. Empty cells should be an empty string "".
                     2. Convert fractions in hours to decimals (e.g., "1 ½" becomes 1.5).
-                    3. Calculate the exact count of each record type (e.g., how many days of OT, AL, UPL).
-                    4. Calculate the total sum of OT hours.
 
-                    Return EXACTLY this JSON structure as a LIST (Array) of objects, one object per document/employee:
+                    Return EXACTLY this JSON structure (as an Array of objects):
                     [
-                      {
-                        "employee": {
-                          "Company": "String", "Name": "String", "Position": "String", "Month": "String", "Emp No": "String"
-                        },
-                        "records": [
-                          {"Date": "String", "Type (Leave/OT)": "String", "Reason/Remark": "String", "Time From": "String", "Time To": "String", "Hours": "Number"}
-                        ],
-                        "summary": {
-                          "Total OT Hours": "Number",
-                          "Total OT Days": "Number",
-                          "Total AL Days": "Number",
-                          "Total UPL Days": "Number",
-                          "Total MC Days": "Number"
-                        },
-                        "signatures": {
-                          "Confirmed By": "String",
-                          "Approval By": "String"
-                        }
-                      }
+                        {{
+                          "employee": {{
+                            "Company": "String", "Name": "String", "Position": "String", "Month": "String", "Emp No": "String"
+                          }},
+                          "records": [
+                            {{"Date": "String", "Type (Leave/OT)": "String", "Reason/Remark": "String", "Time From": "String", "Time To": "String", "Hours": "Number"}}
+                          ],
+                          "signatures": {{
+                            "Confirmed By": "String", "Approval By": "String"
+                          }}
+                        }}
                     ]
                     """
 
                     try:
-                        request_content = [prompt] + images
-                        # Using model_flash based on your setup, but model_pro is recommended for multi-page tables
+                        request_content = [prompt]
+                        for i, img in enumerate(images):
+                            request_content.append(f"--- START OF IMAGE {i + 1} ---")
+                            request_content.append(img)
+                            request_content.append(f"--- END OF IMAGE {i + 1} ---")
+
                         response = model_flash.generate_content(
                             request_content,
-                            generation_config=genai.types.GenerationConfig(temperature=0.1)
+                            generation_config=genai.types.GenerationConfig(temperature=0.0) # Lowered to 0 for maximum strictness
                         )
                         
                         clean_json = response.text.replace('```json', '').replace('```', '').strip()
-                        data = json.loads(clean_json)
+                        extracted_data_list = json.loads(clean_json)
 
-                        # SAFEGUARD: Ensure data is always a list
-                        if not isinstance(data, list):
-                            data = [data]
+                        if not isinstance(extracted_data_list, list):
+                            extracted_data_list = [extracted_data_list]
 
-                        st.success(f'Extraction Complete! Processed {len(data)} records.')
+                        st.success(f'Extraction Complete! Processed {len(extracted_data_list)} records in 1 request.')
                         
-                        # --- PREPARE MASTER LISTS FOR EXCEL ---
                         all_records_df = []
                         all_summaries_df = []
 
-                        # --- 1. BUILD THE UI (Loop through each extracted sheet) ---
-                        for idx, sheet in enumerate(data):
+                        # --- BUILD THE UI & CALCULATE MATH IN PYTHON ---
+                        for idx, sheet in enumerate(extracted_data_list):
                             with st.expander(f"📄 Record {idx + 1}: {sheet.get('employee', {}).get('Name', 'Unknown')}", expanded=True):
+                                
                                 st.markdown("### Employee Information")
                                 for key, value in sheet.get('employee', {}).items():
                                     st.markdown(f"* **{key}:** {value}")
                                     
                                 st.markdown("### Overtime & Leave Records")
                                 df_records = pd.DataFrame(sheet.get('records', []))
+                                
+                                # --- NEW: EXACT PANDAS CALCULATIONS ---
+                                calculated_summary = {
+                                    "Total OT Hours": 0.0,
+                                    "Total OT Days": 0,
+                                    "Total AL Days": 0,
+                                    "Total UPL Days": 0,
+                                    "Total MC Days": 0
+                                }
+
+                                if not df_records.empty:
+                                    
+                                    # 1. Helper function to calculate hours from 'Time From' and 'Time To'
+                                    def calc_hours(row):
+                                        start_str = str(row.get('Time From', '')).strip()
+                                        end_str = str(row.get('Time To', '')).strip()
+                                        
+                                        # Converts strings like "4.30" or "4:30" to decimal hours (4.5)
+                                        def to_decimal(t):
+                                            t = t.replace('.', ':').replace(',', ':').lower().replace('am', '').replace('pm', '').strip()
+                                            if not t: return None
+                                            if ':' not in t:
+                                                try: return float(t)
+                                                except: return None
+                                            parts = t.split(':')
+                                            try: return float(parts[0]) + (float(parts[1]) / 60.0)
+                                            except: return None
+                                            
+                                        start_val = to_decimal(start_str)
+                                        end_val = to_decimal(end_str)
+                                        
+                                        # If both times are readable, calculate the difference
+                                        if start_val is not None and end_val is not None:
+                                            diff = end_val - start_val
+                                            if diff < 0:
+                                                diff += 12 # Handles crossing 12 o'clock (e.g., 11:00 to 2:00 -> 3 hours)
+                                            return round(diff, 2)
+                                        
+                                        # Fallback: If From/To are blank or unreadable, trust the OCR 'Hours' column
+                                        try:
+                                            return float(row.get('Hours', 0))
+                                        except:
+                                            return 0.0
+
+                                    # Apply the calculation to create a new, reliable 'Calculated Hours' column
+                                    df_records['Calculated Hours'] = df_records.apply(calc_hours, axis=1)
+                                    
+                                    if 'Type (Leave/OT)' in df_records.columns:
+                                        # Normalize text to uppercase
+                                        type_col = df_records['Type (Leave/OT)'].fillna('').astype(str).str.upper()
+                                        
+                                        # 2. Flag as OT if it explicitly says 'OT', OR if the column is blank but has calculated hours > 0
+                                        is_ot_condition = type_col.str.contains('OT') | ((type_col == '') & (df_records['Calculated Hours'] > 0))
+                                        
+                                        # 3. Apply the calculations using our newly calculated hours
+                                        calculated_summary["Total OT Hours"] = df_records[is_ot_condition]['Calculated Hours'].sum()
+                                        calculated_summary["Total OT Days"] = is_ot_condition.sum()
+                                        
+                                        calculated_summary["Total AL Days"] = type_col.str.contains('AL').sum()
+                                        calculated_summary["Total UPL Days"] = type_col.str.contains('UPL').sum()
+                                        calculated_summary["Total MC Days"] = type_col.str.contains('MC').sum()
+
                                 st.dataframe(df_records, use_container_width=True)
                                 
                                 col_sum1, col_sum2 = st.columns(2)
                                 with col_sum1:
-                                    st.markdown("### Leave/OT Summary")
-                                    for key, value in sheet.get('summary', {}).items():
+                                    st.markdown("### Leave/OT Summary (Calculated)")
+                                    for key, value in calculated_summary.items():
                                         st.markdown(f"* **{key}:** {value}")
                                 with col_sum2:
                                     st.markdown("### Signatures")
@@ -234,29 +387,63 @@ if uploaded_files:
                             emp_no = sheet.get('employee', {}).get('Emp No', 'Unknown')
                             month = sheet.get('employee', {}).get('Month', 'Unknown')
 
-                            # Inject Employee details into the records so we know whose OT is whose in the master Excel
                             if not df_records.empty:
                                 df_records.insert(0, 'Month', month)
                                 df_records.insert(0, 'Emp No', emp_no)
                                 df_records.insert(0, 'Employee Name', emp_name)
                                 all_records_df.append(df_records)
 
-                            # Create a flat row for the summary sheet
-                            summary_row = sheet.get('employee', {})
-                            summary_row.update(sheet.get('summary', {}))
+                            summary_row = sheet.get('employee', {}).copy()
+                            summary_row.update(calculated_summary) # Inject the Python-calculated summary
                             all_summaries_df.append(summary_row)
 
-                        # --- 2. GENERATE MASTER EXCEL FILE ---
+                        # --- GENERATE MASTER EXCEL FILE ---
                         if all_records_df:
                             final_records = pd.concat(all_records_df, ignore_index=True)
                             final_summaries = pd.DataFrame(all_summaries_df)
 
                             output = io.BytesIO()
                             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                                # Write combined master sheets
                                 final_records.to_excel(writer, index=False, sheet_name='All OT Records')
                                 final_summaries.to_excel(writer, index=False, sheet_name='All Summaries')
                                 
+                                # --- NEW: APPLY EXCEL TABLE FORMATTING & LINES ---
+                                workbook = writer.book
+                                
+                                for sheet_name in ['All OT Records', 'All Summaries']:
+                                    worksheet = writer.sheets[sheet_name]
+                                    max_row = worksheet.max_row
+                                    max_col = worksheet.max_column
+                                    
+                                    # 1. Define the table range (e.g., "A1:G15")
+                                    table_range = f"A1:{get_column_letter(max_col)}{max_row}"
+                                    
+                                    # 2. Create the Table object
+                                    safe_name = sheet_name.replace(" ", "_") # Excel table names can't have spaces
+                                    tab = Table(displayName=safe_name, ref=table_range)
+                                    
+                                    # 3. Apply a default Excel style (Adds lines, banded rows, and header filters)
+                                    style = TableStyleInfo(
+                                        name="TableStyleMedium9", 
+                                        showRowStripes=True,
+                                        showColumnStripes=False
+                                    )
+                                    tab.tableStyleInfo = style
+                                    worksheet.add_table(tab)
+                                    
+                                    # 4. Auto-adjust column widths so text isn't hidden
+                                    for col in worksheet.columns:
+                                        max_length = 0
+                                        column = col[0].column_letter # Get the column name
+                                        for cell in col:
+                                            try:
+                                                if len(str(cell.value)) > max_length:
+                                                    max_length = len(str(cell.value))
+                                            except:
+                                                pass
+                                        adjusted_width = (max_length + 2)
+                                        worksheet.column_dimensions[column].width = adjusted_width
+
                             excel_data = output.getvalue()
                             
                             st.download_button(
@@ -267,7 +454,7 @@ if uploaded_files:
                                 type="primary",
                                 use_container_width=True
                             )
-                        
+                            
                     except Exception as e:
-                        st.error(f'Error parsing data. Please try again.')
+                        st.error(f"Error processing batch: {e}")
                         st.expander("View Error Log").write(e)
