@@ -38,17 +38,44 @@ st.write('Upload or capture a photo of the document.')
 
 upload_option = st.radio('Input Method:', ('Camera', 'Upload Image'), horizontal=True)
 
+# ---> THE FIX: Initialize it here so it always exists <---
+uploaded_files = [] 
+
 if upload_option == 'Camera':
-    # Streamlit's camera_input only handles one image at a time natively
-    camera_file = st.camera_input('Capture Report')
-    uploaded_files = [camera_file] if camera_file else []
+    # 1. Initialize session state to keep track of whether the camera should be ON or OFF
+    if 'camera_active' not in st.session_state:
+        st.session_state.camera_active = False
+
+    # 2. Show the "Open Camera" button if the camera is currently OFF
+    if not st.session_state.camera_active:
+        if st.button('📸 Open Camera', use_container_width=True):
+            st.session_state.camera_active = True
+            st.rerun() # Refresh the page to load the camera
+    
+    # 3. Show the camera ONLY if active
+    else:
+        if st.button('❌ Close Camera', use_container_width=True):
+            st.session_state.camera_active = False
+            st.rerun() # Refresh to hide the camera
+            
+        camera_file = st.camera_input('Capture Report', label_visibility="collapsed")
+        # Only overwrite our empty list if a photo was actually taken
+        if camera_file:
+            uploaded_files = [camera_file]
+
 else:
+    # Ensure camera turns off if they switch to "Upload Image"
+    st.session_state.camera_active = False 
+    
     # File uploader configured to accept multiple images
-    uploaded_files = st.file_uploader(
+    uploader_files = st.file_uploader(
         'Upload Report Pages', 
         type=['jpg', 'png', 'jpeg'], 
         accept_multiple_files=True
     )
+    # Only overwrite our empty list if files were uploaded
+    if uploader_files:
+        uploaded_files = uploader_files
 
 # ==========================================
 # 4. ANALYSIS & DISPLAY
