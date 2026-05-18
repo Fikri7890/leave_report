@@ -269,11 +269,13 @@ if uploaded_files:
         # ------------------------------------------
         # MODE B: LEAVE/OVERTIME RECORD
         # ------------------------------------------
+        # ------------------------------------------
+        # MODE B: LEAVE/OVERTIME RECORD
+        # ------------------------------------------
         elif app_mode == "Leave/Overtime OCR":
             if st.button('Extract Overtime Data & Generate Excel', use_container_width=True):
                 with st.spinner(f'Batch processing {len(images)} images in a SINGLE request...'):
                     
-                    # 1. Prompt simplified: AI no longer calculates the summary.
                     prompt = f"""
                     You are a data extraction assistant. I am providing you with {len(images)} images of Leave/Overtime Records.
                     You MUST extract the data for EVERY SINGLE IMAGE provided.
@@ -311,7 +313,7 @@ if uploaded_files:
 
                         response = model_flash.generate_content(
                             request_content,
-                            generation_config=genai.types.GenerationConfig(temperature=0.0) # Lowered to 0 for maximum strictness
+                            generation_config=genai.types.GenerationConfig(temperature=0.0) 
                         )
                         
                         clean_json = response.text.replace('```json', '').replace('```', '').strip()
@@ -320,14 +322,42 @@ if uploaded_files:
                         if not isinstance(extracted_data_list, list):
                             extracted_data_list = [extracted_data_list]
 
-                        st.success(f'Extraction Complete! Processed {len(extracted_data_list)} records in 1 request.')
+                        # ==========================================
+                        # --- NEW: GROUP PAGES BY EMPLOYEE NAME ---
+                        # ==========================================
+                        consolidated_data = {}
+                        for sheet in extracted_data_list:
+                            emp_info = sheet.get('employee', {})
+                            # Normalize name to Title Case so "Akmal Hakim" matches "AKMAL HAKIM"
+                            emp_name = str(emp_info.get('Name', 'Unknown')).strip().title()
+                            
+                            if emp_name not in consolidated_data:
+                                # First time seeing this employee, create their profile
+                                consolidated_data[emp_name] = {
+                                    'employee': emp_info,
+                                    'records': [],
+                                    'signatures': sheet.get('signatures', {})
+                                }
+                            else:
+                                # We found another page for this same employee!
+                                # Let's update the month label so it says "MAR 2026 & APRIL 2026"
+                                existing_month = str(consolidated_data[emp_name]['employee'].get('Month', ''))
+                                new_month = str(emp_info.get('Month', ''))
+                                if new_month and new_month not in existing_month:
+                                    consolidated_data[emp_name]['employee']['Month'] = f"{existing_month} & {new_month}"
+
+                            # Add this page's rows to the employee's master list of rows
+                            consolidated_data[emp_name]['records'].extend(sheet.get('records', []))
+
+                        st.success(f'Extraction Complete! Processed {len(images)} pages into {len(consolidated_data)} employee records.')
                         
                         all_records_df = []
                         all_summaries_df = []
 
                         # --- BUILD THE UI & CALCULATE MATH IN PYTHON ---
-                        for idx, sheet in enumerate(extracted_data_list):
-                            with st.expander(f"📄 Record {idx + 1}: {sheet.get('employee', {}).get('Name', 'Unknown')}", expanded=True):
+                        # Notice we now loop through consolidated_data instead of extracted_data_list
+                        for idx, (emp_name, sheet) in enumerate(consolidated_data.items()):
+                            with st.expander(f"📄 Record {idx + 1}: {emp_name}", expanded=True):
                                 
                                 st.markdown("### Employee Information")
                                 for key, value in sheet.get('employee', {}).items():
@@ -336,7 +366,7 @@ if uploaded_files:
                                 st.markdown("### Overtime & Leave Records")
                                 df_records = pd.DataFrame(sheet.get('records', []))
                                 
-                                # --- NEW: EXACT PANDAS CALCULATIONS ---
+                                # --- EXACT PANDAS CALCULATIONS ---
                                 calculated_summary = {
                                     "Total OT Hours": 0.0,
                                     "Total OT Days": 0,
@@ -347,12 +377,10 @@ if uploaded_files:
 
                                 if not df_records.empty:
                                     
-                                    # 1. Helper function to calculate hours from 'Time From' and 'Time To'
                                     def calc_hours(row):
                                         start_str = str(row.get('Time From', '')).strip()
                                         end_str = str(row.get('Time To', '')).strip()
                                         
-                                        # Converts strings like "4.30" or "4:30" to decimal hours (4.5)
                                         def to_decimal(t):
                                             t = t.replace('.', ':').replace(',', ':').lower().replace('am', '').replace('pm', '').strip()
                                             if not t: return None
@@ -366,30 +394,23 @@ if uploaded_files:
                                         start_val = to_decimal(start_str)
                                         end_val = to_decimal(end_str)
                                         
-                                        # If both times are readable, calculate the difference
                                         if start_val is not None and end_val is not None:
                                             diff = end_val - start_val
                                             if diff < 0:
-                                                diff += 12 # Handles crossing 12 o'clock (e.g., 11:00 to 2:00 -> 3 hours)
+                                                diff += 12 
                                             return round(diff, 2)
                                         
-                                        # Fallback: If From/To are blank or unreadable, trust the OCR 'Hours' column
                                         try:
                                             return float(row.get('Hours', 0))
                                         except:
                                             return 0.0
 
-                                    # Apply the calculation to create a new, reliable 'Calculated Hours' column
                                     df_records['Calculated Hours'] = df_records.apply(calc_hours, axis=1)
                                     
                                     if 'Type (Leave/OT)' in df_records.columns:
-                                        # Normalize text to uppercase
                                         type_col = df_records['Type (Leave/OT)'].fillna('').astype(str).str.upper()
-                                        
-                                        # 2. Flag as OT if it explicitly says 'OT', OR if the column is blank but has calculated hours > 0
                                         is_ot_condition = type_col.str.contains('OT') | ((type_col == '') & (df_records['Calculated Hours'] > 0))
                                         
-                                        # 3. Apply the calculations using our newly calculated hours
                                         calculated_summary["Total OT Hours"] = df_records[is_ot_condition]['Calculated Hours'].sum()
                                         calculated_summary["Total OT Days"] = is_ot_condition.sum()
                                         
@@ -410,7 +431,6 @@ if uploaded_files:
                                         st.markdown(f"* **{key}:** {value}")
 
                             # --- COMPILE DATA FOR MASTER EXCEL ---
-                            emp_name = sheet.get('employee', {}).get('Name', 'Unknown')
                             emp_no = sheet.get('employee', {}).get('Emp No', 'Unknown')
                             month = sheet.get('employee', {}).get('Month', 'Unknown')
 
@@ -421,7 +441,7 @@ if uploaded_files:
                                 all_records_df.append(df_records)
 
                             summary_row = sheet.get('employee', {}).copy()
-                            summary_row.update(calculated_summary) # Inject the Python-calculated summary
+                            summary_row.update(calculated_summary) 
                             all_summaries_df.append(summary_row)
 
                         # --- GENERATE MASTER EXCEL FILE ---
@@ -434,7 +454,6 @@ if uploaded_files:
                                 final_records.to_excel(writer, index=False, sheet_name='All OT Records')
                                 final_summaries.to_excel(writer, index=False, sheet_name='All Summaries')
                                 
-                                # --- NEW: APPLY EXCEL TABLE FORMATTING & LINES ---
                                 workbook = writer.book
                                 
                                 for sheet_name in ['All OT Records', 'All Summaries']:
@@ -442,26 +461,17 @@ if uploaded_files:
                                     max_row = worksheet.max_row
                                     max_col = worksheet.max_column
                                     
-                                    # 1. Define the table range (e.g., "A1:G15")
                                     table_range = f"A1:{get_column_letter(max_col)}{max_row}"
-                                    
-                                    # 2. Create the Table object
-                                    safe_name = sheet_name.replace(" ", "_") # Excel table names can't have spaces
+                                    safe_name = sheet_name.replace(" ", "_") 
                                     tab = Table(displayName=safe_name, ref=table_range)
                                     
-                                    # 3. Apply a default Excel style (Adds lines, banded rows, and header filters)
-                                    style = TableStyleInfo(
-                                        name="TableStyleMedium9", 
-                                        showRowStripes=True,
-                                        showColumnStripes=False
-                                    )
+                                    style = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True, showColumnStripes=False)
                                     tab.tableStyleInfo = style
                                     worksheet.add_table(tab)
                                     
-                                    # 4. Auto-adjust column widths so text isn't hidden
                                     for col in worksheet.columns:
                                         max_length = 0
-                                        column = col[0].column_letter # Get the column name
+                                        column = col[0].column_letter 
                                         for cell in col:
                                             try:
                                                 if len(str(cell.value)) > max_length:
