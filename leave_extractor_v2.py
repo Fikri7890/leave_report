@@ -377,6 +377,10 @@ if uploaded_files:
 
                                 if not df_records.empty:
                                     
+                                    # --- THE FIX: Clean the 'Hours' column so Streamlit doesn't crash ---
+                                    if 'Hours' in df_records.columns:
+                                        df_records['Hours'] = pd.to_numeric(df_records['Hours'], errors='coerce').fillna(0)
+                                    
                                     def calc_hours(row):
                                         start_str = str(row.get('Time From', '')).strip()
                                         end_str = str(row.get('Time To', '')).strip()
@@ -408,16 +412,27 @@ if uploaded_files:
                                     df_records['Calculated Hours'] = df_records.apply(calc_hours, axis=1)
                                     
                                     if 'Type (Leave/OT)' in df_records.columns:
+                                        # Normalize text to uppercase for BOTH columns
                                         type_col = df_records['Type (Leave/OT)'].fillna('').astype(str).str.upper()
-                                        is_ot_condition = type_col.str.contains('OT') | ((type_col == '') & (df_records['Calculated Hours'] > 0))
+                                        remark_col = df_records.get('Reason/Remark', pd.Series(index=df_records.index, dtype=str)).fillna('').astype(str).str.upper()
+                                        
+                                        # Combine both columns together
+                                        combined_text = type_col + " " + remark_col
+                                        
+                                        # --- THE FIX: Use regex word boundaries (\b) so 'AL' inside 'MATERIAL' is ignored ---
+                                        
+                                        # 1. Flag OT only if 'OT' is a standalone word, OR if hours > 0
+                                        is_ot_condition = combined_text.str.contains(r'\bOT\b', regex=True) | ((type_col == '') & (df_records['Calculated Hours'] > 0))
                                         
                                         calculated_summary["Total OT Hours"] = df_records[is_ot_condition]['Calculated Hours'].sum()
                                         calculated_summary["Total OT Days"] = is_ot_condition.sum()
                                         
-                                        calculated_summary["Total AL Days"] = type_col.str.contains('AL').sum()
-                                        calculated_summary["Total UPL Days"] = type_col.str.contains('UPL').sum()
-                                        calculated_summary["Total MC Days"] = type_col.str.contains('MC').sum()
+                                        # 2. Flag Leave types using strict word boundaries
+                                        calculated_summary["Total AL Days"] = combined_text.str.contains(r'\bAL\b', regex=True).sum()
+                                        calculated_summary["Total UPL Days"] = combined_text.str.contains(r'\bUPL\b', regex=True).sum()
+                                        calculated_summary["Total MC Days"] = combined_text.str.contains(r'\bMC\b', regex=True).sum()
 
+                                # Streamlit can now safely draw the dataframe because the 'Hours' column is pure math
                                 st.dataframe(df_records, use_container_width=True)
                                 
                                 col_sum1, col_sum2 = st.columns(2)
